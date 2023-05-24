@@ -1,431 +1,411 @@
 import numpy as np
 import networkx as nx
-import scipy.sparse as sps
+import scipy.sparse as sparse
 import pandas as pd
 import random 
-from utils import create_A_tilde, normalize_by_row, self_cosine_similarity, save_embedding
-from karateclub import FSCNMF, TADW, TENE, BANE, MUSAE, FeatherNode, DeepWalk, SINE
-from utils import normalize_by_row, normalize_by_column
+from utils import cosine_similarity, save_embedding
+from utils import min_max_row_normalize, sum_row_normalize, cosine_similarity
 
 
-class CN():
-	def __init__(self, graph):
-		self.graph = graph
+def A2H(A, X, beta):
+	"""
+	Creating adjacency matrix of networks extending attributes as nodes. 
+	Attributed Netowrks change to Heterogeneous Networks.
 
-	def get_scores_matrix(self):
-		self.S = nx.adjacency_matrix(self.graph, nodelist = range(self.graph.number_of_nodes()))
-		self.S = sps.csr_matrix(self.S.dot(self.S.T))
-		return self.S.toarray()
+	Args:
+		A(Array of Numpy): Adjacency matrix of original nodes.
+		X(Array of Numpy): Attributes matrix.
 
-	def get_scores(self, edges):
-		X_score = []
-		for edge1, edge2 in edges:
-			X_score.append(self.S[edge1][edge2])
-		return X_score
+	Return:
+		Adacency matrix of extended networks.
+	"""
+	A1 = np.array(sum_row_normalize(A))
+	X1 = min_max_row_normalize(X)
+	X1 = np.array(sum_row_normalize(X1))
+	Xt = np.array(sum_row_normalize(X1.T))
+	A1 = np.hstack([A1, beta*X1])
+	A2 = np.hstack([beta*Xt, np.eye(X1.shape[-1])])
+	AX = np.vstack([A1, A2])
+	AX = np.array(sum_row_normalize(AX))
+	return AX
 
 
-class CNK():
-	def __init__(self, graph, order=5):
-		self.graph = graph
-		self.order = order
+def A2H2M(A, X, beta, gamma):
+	"""
+	Creating adjacency matrix of multiplex networks extended from heterogenous networks extended from attributed networks.. 
+	Attributed Netowrks change to Heterogeneous Networks, then change to Multiplex Networks.
 
-	def get_scores_matrix(self):
-		#A = nx.adjacency_matrix(self.graph, nodelist = range(self.graph.number_of_nodes()))
-		A, D_inv = create_A_tilde(self.graph)
-		A1, A11, A2, A22 = A.copy(), A.copy(), A.copy(), A.copy()
-		for _ in range(self.order):
-			# A11 = sps.csr_matrix(A11.dot(A11.T))
-			# A1 += A11
-			A22 += sps.csr_matrix(A22.dot(A))
-			A2 += A22
+	Args:
+		A(Array of Numpy): Adjacency matrix of original nodes.
+		X(Array of Numpy): Attributes matrix.
 
-		self.S = A2.toarray()
-		# self.S = (A11 + A22).toarray()
+	Return:
+		Adacency matrix of extended networks.
+	"""
+	A = np.array(sum_row_normalize(A))
+	Xr = min_max_row_normalize(X)
+	Xc = min_max_row_normalize(X.T)
+	X = Xr.dot(Xc)
+	X += X.T
+	X = sum_row_normalize(X)
+
+	I = gamma * np.eye(A.shape[0])
+	A1 = np.hstack([A, I])
+	A2 = np.hstack([I, X])
+	A = np.vstack([A1, A2])
+	return A
+
+
+def select_scores(S, edges):
+	"""
+	Selecting similarity scores by specific node pairs.
+
+	Args:
+		edges(list): List of tuples of node pairs.
+
+	Return:
+		List of similarity scroes of node pairs.
+	"""
+	X_score = []
+	for edge1, edge2 in edges:
+		X_score.append(S[edge1][edge2])
+	return X_score
+
+
+class CN:
+	"""
+	Node similarity based on common neighbors.
+
+	Args:
+		graph(Graph of Networkx): Graph object created by Networkx.
+		attribute(Array of Numpy): Attributes matrix.
+		s(float): The strength of links between original nodes and attributes. 
+	"""
+	def __init__(self, beta=1, gamma=1, attribute=None, multiple=False):
+		self.beta = beta
+		self.gamma = gamma
+		self.attribute = attribute
+		self.multiple = multiple
+
+	def get_scores_matrix(self, graph):
+		"""
+		Calculating similarity matrix.
+
+		Return type:
+			Array of Numpy.
+		"""
+		A = nx.adjacency_matrix(graph, nodelist = range(graph.number_of_nodes()))
+
+		if self.multiple:
+			A = A2H2M(A, self.attribute, self.beta, self.gamma)
+		elif self.attribute is not None:
+			A = A2H(A, self.attribute, self.beta)
+
+		self.S = A.dot(A.T)
 		return self.S
 
 	def get_scores(self, edges):
-		X_score = []
-		for edge1, edge2 in edges:
-			X_score.append(self.S[edge1][edge2])
-		return X_score
+		return select_scores(self.S, edges)
 
 
-class CNA():
-	def __init__(self, graph, attribute):
-		self.graph = graph
+class CNC:
+	"""
+	Node similarity combining common neighbor and cosine simialrity of attributes of nodes.
+	
+	"""
+	def __init__(self, beta=1, attribute=None):
+		self.beta = beta
 		self.attribute = attribute
 
-	def get_scores_matrix(self):
-		A = nx.adjacency_matrix(self.graph, nodelist = range(self.graph.number_of_nodes()))
-		self.S = sps.coo_matrix(A.dot(A.T))
-		self.S1 = normalize_by_row(self.S)
-		self.S2 = self_cosine_similarity(self.attribute)
-		self.S1_norm = (self.S1 - np.min(self.S1)) / (np.max(self.S1) - np.min(self.S1))
-		self.S2_norm = (self.S2 - np.min(self.S2)) / (np.max(self.S2) - np.min(self.S2))
-		self.S = self.S1_norm + self.S2_norm
+	def get_scores_matrix(self, graph):
+		A = nx.adjacency_matrix(graph, nodelist = range(graph.number_of_nodes())) 
+		S1 = A.dot(A.T).toarray()
+		S1 = sum_normalize(S1)
+		S2 = cosine_similarity(self.attribute, self.attribute)
+		S2 = sum_row_normalize(S2)
+		self.S = S1 + self.beta*S2
 		return self.S
 
 	def get_scores(self, edges):
-		X_score = []
-		for edge1, edge2 in edges:
-			X_score.append(self.S[edge1][edge2])
-		return X_score
+		return select_scores(self.S, edges)
 
-class ATT():
-	def __init__(self, graph, attribute):
-		self.graph = graph
+
+class CSA:
+	"""
+	Node similarity based on Cosine Simialrity of Attributes of nodes.
+		
+	"""
+	def __init__(self, attribute):
 		self.attribute = attribute
 
 	def get_scores_matrix(self):
-		self.S = self_cosine_similarity(self.attribute)
+		self.S = cosine_similarity(self.attribute)
+		return self.S
 
 	def get_scores(self, edges):
-		X_score = []
-		for edge1, edge2 in edges:
-			X_score.append(self.S[edge1][edge2])
-		return X_score
+		return select_scores(self.S, edges)
 
 
-class JC():
-	def __init__(self, graph):
-		self.graph = graph
+class JC:
+	"""
+	Node similarity based on Jaccard Index.
 
-	def get_scores_matrix(self):
-		A = nx.adjacency_matrix(self.graph, nodelist = range(self.graph.number_of_nodes()))
-		CN = sps.coo_matrix(A.dot(A.T))
-		AN = sps.coo_matrix(A + A.T)
-		# print('AN.data', AN.data)
+	"""
+	def __init__(self, beta=1, gamma=1, attribute=None, multiple=False):
+		self.beta = beta
+		self.gamma = gamma
+		self.attribute = attribute
+		self.multiple = multiple
+
+	def get_scores_matrix(self, graph):
+		"""
+		Jaccard Index (x,y) = (N(x) cap N(y)) / (N(x) cup N(y)), 
+		where N(x) is the set of neighbor of vertex x.
+		
+		"""
+		A = nx.adjacency_matrix(graph, nodelist = range(graph.number_of_nodes()))
+
+		if self.multiple:
+			A = A2H2M(A, self.attribute, self.beta, self.gamma)
+		elif self.attribute is not None:
+			A = A2H(A, self.attribute, self.beta)
+
+		CN = sparse.coo_matrix(A.dot(A.T))
+		AN = sparse.coo_matrix(A + A.T)
 		AN.data = np.minimum(AN.data, 1)
-		# print('AN.data', AN.data)
 		AN = AN.sum(-1).flatten()
-		# print('AN', AN)
-		self.S = np.array(CN / AN)
+		S = np.array(CN / AN)
+		self.S = S
 		return self.S
 
 	def get_scores(self, edges):
-		X_score = []
-		for edge1, edge2 in edges:
-			X_score.append(self.S[edge1][edge2])
-			# num = np.sum(self.S[edge1] * self.S[edge2])
-			# denum = np.sum(np.maximum(1, np.minimum(self.S[edge1] + self.S[edge2], 1)))
-			# X_score.append(num / denum)
-		return X_score
+		return select_scores(self.S, edges)
 
 
-class JCA():
-	def __init__(self, graph, attribute):
-		self.graph = graph
+class JCC:
+	"""
+	Node similarity combining Jaccard Index and cosine simialrity of attributes of nodes.
+
+	"""
+	def __init__(self, beta=1, attribute=None):
+		self.beta = beta
 		self.attribute = attribute
 
-	def get_scores_matrix(self):
-		self.S1 = nx.adjacency_matrix(self.graph, nodelist = range(self.graph.number_of_nodes())).toarray()
-		self.S2 = self_cosine_similarity(self.attribute)
-		self.S1_norm = (self.S1 - np.min(self.S1)) / (np.max(self.S1) - np.min(self.S1))
-		self.S2_norm = (self.S2 - np.min(self.S2)) / (np.max(self.S2) - np.min(self.S2))
-		return self.S1_norm + self.S2_norm
+	def get_scores_matrix(self, graph):
+		A = nx.adjacency_matrix(graph, nodelist = range(graph.number_of_nodes()))
+		CN = sparse.coo_matrix(A.dot(A.T))
+		AN = sparse.coo_matrix(A + A.T)
+		AN.data = np.minimum(AN.data, 1)
+		AN = AN.sum(-1).flatten()
+		S1 = np.array(CN / AN)
+		S1 = sum_row_normalize(S1)
+		S2 = cosine_similarity(self.attribute, self.attribute)
+		S2 =  sum_row_normalize(S2)
+		self.S = S1 + self.beta*S2
+		return self.S
 		
 	def get_scores(self, edges):
-		
-		structure_score = []
-		attribute_score = []
-		
-		for edge1, edge2 in edges:
-			num = np.sum(self.S1[edge1] * self.S1[edge2])
-			denum = np.sum(np.maximum(1, np.minimum(self.S1[edge1] + self.S1[edge2], 1)))
-			structure_score.append(num / denum)
-		structure_score = np.asarray(structure_score)
-		structure_score = (structure_score - np.min(structure_score)) / np.max(structure_score)
-		
-		for edge1, edge2 in edges:
-			attribute_score.append(self.S2[edge1][edge2])
-		attribute_score = np.asarray(attribute_score)
-		attribute_score = (attribute_score - np.min(attribute_score)) / np.max(attribute_score)
-
-		X_score = structure_score + attribute_score
-		return X_score
+		return select_scores(self.S, edges)
 
 
-class RPR():
-	def __init__(self, graph, alpha=0.5):
-		self.graph = graph
-		self.alpha = 0.5
+class MTP:
+	"""
+	Node similarity based on Multi-scale Transition Probability.
 
-	def get_scores_matrix(self):
-		A_tilde, D_inv = create_A_tilde(self.graph)
-		tmp = np.linalg.inv(np.eye(self.graph.number_of_nodes()) - self.alpha * A_tilde)
-		self.S = (1-self.alpha) * tmp
-		self.S = np.asarray(self.S)
-		print('self.S', self.S)
-		print('np.where(np.sum(self.S, axis=-1)==0)', np.where(np.sum(self.S, axis=-1)==0))
-		return self.S
-
-
-class MTP():
-	def __init__(self, graph, order=2):
-		self.graph = graph
+	Args:
+		order(int): The order of the transition probability matrix.
+	"""
+	def __init__(self, order=2,  beta=1, gamma=1, attribute=None, multiple=False):
 		self.order = order
+		self.beta = beta
+		self.gamma = gamma
+		self.attribute = attribute
+		self.multiple = multiple
+		
+	def get_scores_matrix(self, graph):
+		A = nx.adjacency_matrix(graph, nodelist = range(graph.number_of_nodes()))
+		
+		if self.multiple:
+			A = A2H2M(A, self.attribute, self.beta, self.gamma)
+		elif self.attribute is not None:
+			A = A2H(A, self.attribute, self.beta)
 
-	def get_scores_matrix(self):
-
-		A_tilde, D_inv = create_A_tilde(self.graph)
+		A_tilde = sum_row_normalize(A)
 		A_pool, A_hat = A_tilde.copy(), A_tilde.copy()
 
 		for _ in range(self.order-1):
-			A_tilde = sps.coo_matrix(A_tilde.dot(A_hat))
+			A_tilde = A_tilde.dot(A_hat)
 			A_pool += A_tilde
-		self.S = np.array(A_pool.todense())
-
+		try:
+			self.S = np.array(A_pool.todense())
+		except:
+			self.S = A_pool
 		return self.S
 
-	# def get_scores_matrix(self):
-
-	# 	A = sps.coo_matrix(nx.adjacency_matrix(self.graph, nodelist = range(self.graph.number_of_nodes())))
-	# 	print('1')
-	# 	A_to = normalize_by_row(A)
-	# 	# A_in = sps.csr_matrix(normalize_by_column(A))
-	# 	# A_in = normalize_by_row(A.T)
-	# 	print('2')
-	# 	A_to_k = A_to.copy()
-	# 	# A_in_k = A_in.copy()
-	# 	print('3')
-	# 	A_in_k = normalize_by_row(A_to_k.T)
-	# 	A_pool = sps.coo_matrix(A_in_k.dot(A_to_k))
-
-	# 	for _ in range(self.order-2):
-	# 		print('i')
-	# 		A_to_k = sps.coo_matrix(A_to_k.dot(A_to))
-	# 		print('i2')
-	# 		A_in_k = normalize_by_row(A_to_k.T)
-	# 		print('i3')
-	# 		A_pool += sps.coo_matrix(A_in_k.dot(A_to_k))
-		
-	# 	self.S = np.array(A_pool.todense())
-	# 	return self.S
-
-
-
 	def get_scores(self, edges):
-		X_score = []
-		for edge1, edge2 in edges:
-			X_score.append(self.S[edge1][edge2]) 
-		return X_score
+		return select_scores(self.S, edges)
 
 
-class TP():
-	def __init__(self, graph, order=2):
-		self.graph = graph
-		self.order = order
+class MMTP:
+	"""
+	Node similarity based on Multi-scale Meta-path Transition Probability.
 
-	def get_scores_matrix(self):
-		A_tilde, D_inv = create_A_tilde(self.graph)
+	Args:
+		k(int): The longest length of the meta-path.
+	"""
+	def __init__(self, k=2, s=1, attribute=None):
+		self.k = k
+		self.s = s
+		self.attribute = attribute
+
+	def get_scores_matrix(self, graph):
+		A = nx.adjacency_matrix(graph, nodelist = range(graph.number_of_nodes()))
+		A_tilde = np.array(sum_row_normalize(A))
 		A_hat = A_tilde.copy()
+		X = self.attribute
+		Xr = min_max_row_normalize(X)
+		Xc = min_max_row_normalize(X.T)
+		X = Xr.dot(Xc)
+		X += X.T
+		X = sum_row_normalize(X)
+		# X = sparse.csr_matrix(X)
 
-		for _ in range(self.order):
-			A_tilde = sps.coo_matrix(A_tilde.dot(A_hat))
-		self.S = A_tilde
-
+		P = A_tilde + self.s * X
+		for i in range(self.k-1):
+			tmp = A_tilde.dot(X)
+			P += self.s * tmp
+			for j in range(i-1):
+				P += self.s * tmp.dot(A_hat)
+			A_tilde = A_tilde.dot(A_hat)
+			P += A_tilde
+		self.S = P
 		return self.S
 
 	def get_scores(self, edges):
-		X_score = []
-		for edge1, edge2 in edges:
-			X_score.append(self.S[edge1][edge2]) 
-		return X_score
+		return select_scores(self.S, edges)
 
 
-class ACT():
-	def __init__(self, graph):
-		self.graph = graph
+class RWR:
+	"""
+	Node similarity based on Random Walk with Restart.
 
-	def get_scores_matrix(self):
-		A = nx.adjacency_matrix(self.graph, nodelist = range(self.graph.number_of_nodes()))
-		index = np.arange(self.graph.number_of_nodes())
-		values = np.array([self.graph.degree[node] for node in range(self.graph.number_of_nodes())])
-		shape = (self.graph.number_of_nodes(), self.graph.number_of_nodes())
-		D = sps.coo_matrix((values, (index, index)), shape=shape)
-		L = np.array((D - A).todense())
-		print('L', L)
-		ones = np.ones(shape) / self.graph.number_of_nodes()
-		print('ones', ones)
-		L_plus = np.linalg.inv(L - ones) + ones
-		print('L_plus', L_plus)
-		L_yy = np.tile(np.diagonal(L_plus), (self.graph.number_of_nodes(), 1))
-		print('L_yy.shape', L_yy.shape)
-		print('L_yy', L_yy)
-		L_xx = L_yy.T
-		self.S = 1 / (L_xx + L_yy - 2*L_plus)
-		print('self.S', self.S)
-		self.S[np.where(self.S == np.inf)] = 0.0
-		print('self.S', self.S)
-		return self.S
-
-class RWR():
-	def __init__(self, graph, alpha=0.5):
-		self.graph = graph
+	Args:
+		graph(Graph of Networkx): Graph object created by Networkx.
+		alpha(float): The probability of random walk jumping to the starting nodes.
+	"""
+	def __init__(self,  alpha=0.5,  beta=1,  gamma=1, attribute=None, multiple=False):
 		self.alpha = alpha
+		self.beta = beta
+		self.gamma = gamma
+		self.attribute = attribute
+		self.multiple = multiple
 
-	def get_scores_matrix(self):
-		A_tilde, D_inv  = create_A_tilde(self.graph)
-		print('A_tilde', np.array(A_tilde.todense()))
-		print('A_tilde.shape', A_tilde.shape)
-		print('D_inv.shape', D_inv.shape)
-		#self.S = (1-self.alpha) * np.linalg.inv((np.eye(A_tilde.shape[0]) - self.alpha * A_tilde.T)).dot(1/A_tilde.shape[0] * np.ones(A_tilde.shape))
-		self.S = (1-self.alpha) * np.linalg.inv((np.eye(A_tilde.shape[0]) - self.alpha * A_tilde.T))
-		self.S = np.asarray(self.S)
-		A_tilde_prox = 1/self.alpha * (np.eye(A_tilde.shape[0]) - np.linalg.inv(self.S / (1-self.alpha)))
-		print('A_tilde_prox', A_tilde_prox)
-		self.S = self.S + self.S.T
-		print('self.S', self.S)
+	def get_scores_matrix(self, graph):
+		A = nx.adjacency_matrix(graph, nodelist = range(graph.number_of_nodes()))
+		
+		if self.multiple:
+			A = A2H2M(A, self.attribute, self.beta, self.gamma)
+		elif self.attribute is not None:
+			A = A2H(A, self.attribute, self.beta)
+
+		A_tilde = sum_row_normalize(A)
+		S = (1-self.alpha) * np.linalg.inv((np.eye(A_tilde.shape[0]) - self.alpha * A_tilde.T))
+		self.S = S + S.T
 		return self.S
 
 	def get_scores(self, edges):
-		X_score = []
-		for edge1, edge2 in edges:
-			X_score.append(self.S[edge1][edge2]) 
-		return X_score 
+		return select_scores(self.S, edges)
 
-class RWRA():
-	def __init__(self, graph, attribute, alpha=0.5):
-		self.graph = graph
-		self.attribute = attribute
+
+class RWRC:
+	"""
+	Node similarity combining Random Walk with Restart and cosine simialrity of attributes of nodes.
+
+	Args:
+		graph(Graph of Networkx): Graph object created by Networkx.
+		attribute(Aarray of Numpy): Attribute matrix.
+		alpha(float): The probability of random walk jumping to the starting nodes.
+	"""
+	def __init__(self, alpha=0.5, beta=1, attribute=None):
 		self.alpha = alpha
-
-	def get_scores_matrix(self):
-		A_tilde, D_inv  = create_A_tilde(self.graph)
-		self.S1 = (1-self.alpha) * np.linalg.inv((np.eye(A_tilde.shape[0]) - self.alpha * A_tilde.T))
-		self.S1 = np.asarray(self.S1)
-		self.S2 = self_cosine_similarity(self.attribute)
-		self.S1_norm = (self.S1 - np.min(self.S1)) / (np.max(self.S1) - np.min(self.S1))
-		self.S2_norm = (self.S2 - np.min(self.S2)) / (np.max(self.S2) - np.min(self.S2))
-		return self.S1_norm + self.S2_norm
-		
-	def get_scores(self, edges):
-		structure_score = []
-		attribute_score = []
-
-		for edge1, edge2 in edges:
-			structure_score.append(self.S1[edge1][edge2]) 
-		structure_score = np.asarray(structure_score)
-		structure_score = (structure_score - np.min(structure_score)) / np.max(structure_score)
-		
-		for edge1, edge2 in edges:
-			attribute_score.append(self.S2[edge1][edge2])
-		attribute_score = np.asarray(attribute_score)
-		attribute_score = (attribute_score - np.min(attribute_score)) / np.max(attribute_score)
-
-		X_score = structure_score + attribute_score
-		return X_score
-
-class KIA():
-	def __init__(self, graph, attribute):
-		self.graph = graph
+		self.beta = 1
 		self.attribute = attribute
 
-	def get_scores_matrix(self):
-		A = nx.adjacency_matrix(self.graph, nodelist = range(self.graph.number_of_nodes()))
-		A = A.asfptype() 
-		value, _ = sps.linalg.eigsh(A, k=1, which='LM')
-		A = A.toarray()
-		print('lambda', value[0])
-		beta = 1 / (value[0] + 1)
-		I = np.eye(A.shape[0])
-		self.S1 = np.linalg.inv(I - beta * A) - I
-		self.S2 = self_cosine_similarity(self.attribute)
-		self.S1_norm = (self.S1 - np.min(self.S1)) / (np.max(self.S1) - np.min(self.S1))
-		self.S2_norm = (self.S2 - np.min(self.S2)) / (np.max(self.S2) - np.min(self.S2))
-		return self.S1_norm + self.S2_norm
+	def get_scores_matrix(self, graph):
+		A = nx.adjacency_matrix(graph, nodelist = range(graph.number_of_nodes()))
+		A_tilde = sum_row_normalize(A)
+		S1 = (1-self.alpha) * np.linalg.inv((np.eye(A_tilde.shape[0]) - self.alpha * A_tilde.T))
+		S1 = S1 + S1.T
+		S1 = sum_row_normalize(S1)
+		S2 = cosine_similarity(self.attribute, self.attribute)
+		S2 =  sum_row_normalize(S2)
+		self.S = S1 + self.beta*S2
+		return self.S
 		
-	def get_scores(self,  edges):
-		structure_score = []
-		attribute_score = []
+	def get_scores(self, edges):
+		return select_scores(self.S, edges)
 
-		for edge1, edge2 in edges:
-			structure_score.append(self.S1[edge1][edge2]) 
-		structure_score = np.asarray(structure_score)
-		structure_score = (structure_score - np.min(structure_score)) / np.max(structure_score)
+
+class KI:
+	"""
+	Node similarity based on Katz Index.
+
+	Args:
+		graph(Graph of Networkx): Graph object created by Networkx.
+	"""
+	def __init__(self, beta=1, gamma=1, attribute=None,multiple=False):
+		self.beta = beta
+		self.gamma = gamma
+		self.attribute = attribute
+		self.multiple = multiple
+
+	def get_scores_matrix(self, graph):
+		A = nx.adjacency_matrix(graph, nodelist = range(graph.number_of_nodes()))
 		
-		for edge1, edge2 in edges:
-			attribute_score.append(self.S2[edge1][edge2])
-		attribute_score = np.asarray(attribute_score)
-		attribute_score = (attribute_score - np.min(attribute_score)) / np.max(attribute_score)
-
-		X_score = structure_score + attribute_score
-		return X_score
-
-class KI():
-	def __init__(self, graph):
-		self.graph = graph
-
-	def get_scores_matrix(self):
-		A = nx.adjacency_matrix(self.graph, nodelist = range(self.graph.number_of_nodes()))
-		A = A.asfptype() 
-		value, _ = sps.linalg.eigsh(A, k=1, which='LM')
-		A = A.toarray()
-		print('A', A)
-		print('lambda', value[0])
-		beta = 1 / (value[0] + 1)
+		if self.multiple:
+			A = A2H2M(A, self.attribute, self.beta, self.gamma)
+		elif self.attribute is not None:
+			A = A2H(A, self.attribute, self.beta)
+		try:
+			value, _ = sparse.linalg.eigsh(A, k=1, which='LM')
+		except:
+			value, _ = sparse.linalg.eigsh(A.asfptype() , k=1, which='LM')
+		epsilon = 1 / (value[0] + 1)
 		I = np.eye(A.shape[0])
-		self.S = np.linalg.inv(I - beta * A) - I
-		A_prox = 1 / beta * (I - np.linalg.inv(self.S + I))
-		print('A_prox', A_prox)
+		try:
+			self.S = np.linalg.inv(I - epsilon * A.toarray()) - I
+		except:
+			self.S = np.linalg.inv(I - epsilon * A) - I
 		return self.S
 
 	def get_scores(self, edges):
-		X_score = []
-		for edge1, edge2 in edges:
-			X_score.append(self.S[edge1][edge2]) 
-		return X_score
+		return select_scores(self.S, edges)
 
 
-class EMB():
-	def __init__(self, graph, attribute, dataset, method, edge_feature, test_percent):
-		self.graph = graph
+class KIC:
+	"""
+	Node similarity combining Katz Index and cosine simialrity of attributes of nodes.
+
+	Args:
+		graph(Graph of Networkx): Graph object created by Networkx.
+		attribute(Aarray of Numpy): Attribute matrix.
+	"""
+	def __init__(self,  attribute, alpha=0.5, beta=1):
+		self.alpha = alpha
+		self.beta = 1
 		self.attribute = attribute
-		self.dataset = dataset
-		self.method = method
-		self.edge_feature = edge_feature
-		self.test_percent = test_percent
 
-	def get_scores_matrix(self):
-		if self.method == 'FeatherNode':
-			model = FeatherNode(reduction_dimensions=32, eval_points=16, order=2)
-		elif self.method == 'SINE':
-			model = SINE(dimensions=256)
-		elif self.method == 'MUSAE':
-			model = MUSAE(dimensions=128)
-		elif self.method == 'TADW':
-			model = TADW(dimensions=128)
-		elif self.method == 'DeepWalk':
-			model = DeepWalk(dimensions=256)
-
-		path_emb = '../output/{}_{}_{}_{}.csv'.format(self.dataset, self.method, self.test_percent, random.randint(1,10000))
-		if self.method == 'DeepWalk':
-			model.fit(self.graph)
-		elif self.method == 'SINE' or 'MUSAE':
-			model.fit(self.graph, sps.coo_matrix(self.attribute))
-		else:
-			model.fit(self.graph, self.attribute)
-
-		X = model.get_embedding()
-		print('X.shape', X.shape)
-
-		save_embedding(X, path_emb)
-		
-		if self.edge_feature == 'cosine_similarity':
-			denum = np.linalg.norm(X, axis=-1)
-			denum[np.where(denum == 0)] = 1.0
-			X = X / denum[:,None]
-			self.S = X.dot(X.T)
-		elif self.edge_feature == 'hadamard':
-			self.S = X
+	def get_scores_matrix(self, graph):
+		A = nx.adjacency_matrix(graph, nodelist = range(graph.number_of_nodes()))
+		value, _ = sparse.linalg.eigsh(A.asfptype() , k=1, which='LM')
+		epsilon = 1 / (value[0] + 1)
+		I = np.eye(A.shape[0])
+		S1 = np.linalg.inv(I - epsilon * A.toarray()) - I
+		S1 = sum_row_normalize(S1)
+		S2 = cosine_similarity(self.attribute)
+		S2 = sum_row_normalize(S2)
+		self.S = S1 + self.beta*S2
 		return self.S
-
+		
 	def get_scores(self, edges):
-		X_score = []
-		if self.edge_feature == 'cosine_similarity':
-			for edge1, edge2 in edges:
-				X_score.append(self.S[edge1][edge2])
-		elif self.edge_feature == 'hadamard':
-			for edge1, edge2 in edges:
-				X_score.append(self.S[edge1] * self.S[edge2])
-		return X_score
+		return select_scores(self.S, edges)
